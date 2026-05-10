@@ -3,9 +3,7 @@ import type { RequestResponsePair, Tool } from "../types/request.js";
 import {
 	filterAndSortTools,
 	filterNonHaikuRequests,
-	filterRequestsWithSystemPrompt,
 	filterRequestsWithTools,
-	hasSystemPrompt,
 	hasTools,
 	selectBestRequest,
 } from "./request-filter.js";
@@ -176,77 +174,6 @@ describe("request-filter", () => {
 		});
 	});
 
-	describe("filterRequestsWithSystemPrompt", () => {
-		it("filters requests with system prompt", () => {
-			const pairs: RequestResponsePair[] = [
-				{
-					request: {
-						timestamp: 1,
-						method: "POST",
-						url: "/",
-						headers: {},
-						body: { model: "claude", messages: [] },
-					},
-					response: {},
-				},
-				{
-					request: {
-						timestamp: 2,
-						method: "POST",
-						url: "/",
-						headers: {},
-						body: {
-							model: "claude",
-							messages: [],
-							system: [{ type: "text", text: "You are Claude" }],
-						},
-					},
-					response: {},
-				},
-			];
-
-			const result = filterRequestsWithSystemPrompt(pairs);
-			expect(result).toHaveLength(1);
-			expect(result[0].request.body.system).toBeDefined();
-		});
-
-		it("excludes requests with empty system array", () => {
-			const pairs: RequestResponsePair[] = [
-				{
-					request: {
-						timestamp: 1,
-						method: "POST",
-						url: "/",
-						headers: {},
-						body: { model: "claude", messages: [], system: [] },
-					},
-					response: {},
-				},
-			];
-
-			const result = filterRequestsWithSystemPrompt(pairs);
-			expect(result).toHaveLength(0);
-		});
-
-		it("excludes requests without system property", () => {
-			const pairs: RequestResponsePair[] = [
-				{
-					request: {
-						timestamp: 1,
-						method: "POST",
-						url: "/",
-						headers: {},
-						body: { model: "claude", messages: [] },
-					},
-					response: {},
-				},
-			];
-
-			const result = filterRequestsWithSystemPrompt(pairs);
-			expect(result).toHaveLength(0);
-		});
-	});
-
 	describe("selectBestRequest", () => {
 		it("selects request with most tools", () => {
 			const pairs: RequestResponsePair[] = [
@@ -259,6 +186,7 @@ describe("request-filter", () => {
 						body: {
 							model: "claude-sonnet",
 							messages: [],
+							system: [{ type: "text", text: "system prompt" }],
 							tools: [
 								{
 									name: "tool1",
@@ -279,6 +207,7 @@ describe("request-filter", () => {
 						body: {
 							model: "claude-sonnet",
 							messages: [],
+							system: [{ type: "text", text: "system prompt" }],
 							tools: [
 								{
 									name: "tool1",
@@ -438,7 +367,7 @@ describe("request-filter", () => {
 							messages: [],
 							// tools property exists but is undefined (edge case)
 							tools: undefined,
-						} as any,
+						},
 					},
 					response: {},
 				},
@@ -446,150 +375,6 @@ describe("request-filter", () => {
 
 			// Should handle undefined tools gracefully during sort
 			const result = selectBestRequest(pairs);
-			expect(result.request.body.tools).toHaveLength(1);
-		});
-	});
-
-	describe("selectBestRequest - system prompt prioritization", () => {
-		it("selects request with tools AND system prompt over tools-only", () => {
-			const pairs: RequestResponsePair[] = [
-				{
-					request: {
-						timestamp: 1,
-						method: "POST",
-						url: "/",
-						headers: {},
-						body: {
-							model: "claude-sonnet",
-							messages: [],
-							tools: [
-								{ name: "tool1", description: "desc", input_schema: { type: "object" } },
-								{ name: "tool2", description: "desc", input_schema: { type: "object" } },
-							],
-						},
-					},
-					response: {},
-				},
-				{
-					request: {
-						timestamp: 2,
-						method: "POST",
-						url: "/",
-						headers: {},
-						body: {
-							model: "claude-sonnet",
-							messages: [],
-							tools: [{ name: "tool1", description: "desc", input_schema: { type: "object" } }],
-							system: [{ type: "text", text: "You are Claude" }],
-						},
-					},
-					response: {},
-				},
-			];
-
-			const result = selectBestRequest(pairs);
-			// Should select request with system prompt even though it has fewer tools
-			expect(result.request.body.system).toBeDefined();
-			expect(result.request.body.tools).toHaveLength(1);
-		});
-
-		it("falls back to tools-only when no system prompt exists", () => {
-			const pairs: RequestResponsePair[] = [
-				{
-					request: {
-						timestamp: 1,
-						method: "POST",
-						url: "/",
-						headers: {},
-						body: { model: "claude-haiku", messages: [] },
-					},
-					response: {},
-				},
-				{
-					request: {
-						timestamp: 2,
-						method: "POST",
-						url: "/",
-						headers: {},
-						body: {
-							model: "claude-sonnet",
-							messages: [],
-							tools: [{ name: "tool1", description: "desc", input_schema: { type: "object" } }],
-						},
-					},
-					response: {},
-				},
-			];
-
-			const result = selectBestRequest(pairs);
-			expect(result.request.body.tools).toHaveLength(1);
-			expect(result.request.body.system).toBeUndefined();
-		});
-
-		it("selects highest tool count among requests with system prompts", () => {
-			const pairs: RequestResponsePair[] = [
-				{
-					request: {
-						timestamp: 1,
-						method: "POST",
-						url: "/",
-						headers: {},
-						body: {
-							model: "claude-sonnet",
-							messages: [],
-							tools: [{ name: "tool1", description: "desc", input_schema: { type: "object" } }],
-							system: [{ type: "text", text: "You are Claude" }],
-						},
-					},
-					response: {},
-				},
-				{
-					request: {
-						timestamp: 2,
-						method: "POST",
-						url: "/",
-						headers: {},
-						body: {
-							model: "claude-sonnet",
-							messages: [],
-							tools: [
-								{ name: "tool1", description: "desc", input_schema: { type: "object" } },
-								{ name: "tool2", description: "desc", input_schema: { type: "object" } },
-								{ name: "tool3", description: "desc", input_schema: { type: "object" } },
-							],
-							system: [{ type: "text", text: "You are Claude" }],
-						},
-					},
-					response: {},
-				},
-			];
-
-			const result = selectBestRequest(pairs);
-			expect(result.request.body.tools).toHaveLength(3);
-			expect(result.request.body.system).toBeDefined();
-		});
-
-		it("handles edge case where system is empty array", () => {
-			const pairs: RequestResponsePair[] = [
-				{
-					request: {
-						timestamp: 1,
-						method: "POST",
-						url: "/",
-						headers: {},
-						body: {
-							model: "claude-sonnet",
-							messages: [],
-							tools: [{ name: "tool1", description: "desc", input_schema: { type: "object" } }],
-							system: [],
-						},
-					},
-					response: {},
-				},
-			];
-
-			const result = selectBestRequest(pairs);
-			// Should still select it (falls back to tools-only tier)
 			expect(result.request.body.tools).toHaveLength(1);
 		});
 	});
@@ -707,57 +492,6 @@ describe("request-filter", () => {
 			};
 
 			expect(hasTools(pair)).toBe(false);
-		});
-	});
-
-	describe("hasSystemPrompt", () => {
-		it("returns true when request has system prompt", () => {
-			const pair: RequestResponsePair = {
-				request: {
-					timestamp: 1,
-					method: "POST",
-					url: "/",
-					headers: {},
-					body: {
-						model: "claude",
-						messages: [],
-						system: [{ type: "text", text: "You are Claude" }],
-					},
-				},
-				response: {},
-			};
-
-			expect(hasSystemPrompt(pair)).toBe(true);
-		});
-
-		it("returns false when system array is empty", () => {
-			const pair: RequestResponsePair = {
-				request: {
-					timestamp: 1,
-					method: "POST",
-					url: "/",
-					headers: {},
-					body: { model: "claude", messages: [], system: [] },
-				},
-				response: {},
-			};
-
-			expect(hasSystemPrompt(pair)).toBe(false);
-		});
-
-		it("returns false when system is undefined", () => {
-			const pair: RequestResponsePair = {
-				request: {
-					timestamp: 1,
-					method: "POST",
-					url: "/",
-					headers: {},
-					body: { model: "claude", messages: [] },
-				},
-				response: {},
-			};
-
-			expect(hasSystemPrompt(pair)).toBe(false);
 		});
 	});
 });
