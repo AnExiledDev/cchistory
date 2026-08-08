@@ -1,10 +1,12 @@
 #!/usr/bin/env node
 
+import { spawn } from "node:child_process";
 import * as path from "node:path";
 import chalk from "chalk";
 import { parse, quote } from "shell-quote";
 import { extractSystemPrompt, findAndExtractUserMessage } from "./core/content-extractor.js";
 import { filterAndSortTools, hasTools, selectBestRequest } from "./core/request-filter.js";
+import { downloadBinary, isNativeBinary, isNativeBinaryPackage } from "./services/binary-service.js";
 import { exists, readDir, readFile, writeFile } from "./services/file-service.js";
 import {
 	downloadPackage,
@@ -12,11 +14,40 @@ import {
 	getLatestVersion,
 	getVersionReleaseDate,
 } from "./services/npm-service.js";
+import { startProxy } from "./services/proxy-service.js";
 import { exec } from "./services/shell-service.js";
 import { cleanupTempDir, createTempWorkDir } from "./services/temp-service.js";
 import type { RequestResponsePair } from "./types/request.js";
 
 const CCHISTORY_FLAGS = ["--latest", "--binary-path", "--claude-args", "--version", "-v", "--help", "-h"];
+
+/**
+ * Spawn Claude as an async child process.
+ * Must be async (not execSync) so the reverse proxy event loop can process requests.
+ */
+function runClaude(
+	command: string,
+	args: string[],
+	options: { cwd: string; env: Record<string, string> },
+): Promise<{ code: number; stderr: string }> {
+	return new Promise((resolve, reject) => {
+		const child = spawn(command, args, {
+			env: { ...process.env, ...options.env },
+			cwd: options.cwd,
+			stdio: ["pipe", "pipe", "pipe"],
+		});
+
+		let stderr = "";
+		child.stderr?.on("data", (data: Buffer) => {
+			stderr += data.toString();
+		});
+
+		child.on("error", reject);
+		child.on("close", (code) => {
+			resolve({ code: code ?? 1, stderr });
+		});
+	});
+}
 
 async function processVersion(
 	versionOrLabel: string,
@@ -37,151 +68,123 @@ async function processVersion(
 		chalk.blue(`Processing ${customBinaryPath ? `custom binary (${customBinaryPath})` : versionOrLabel}...`),
 	);
 
-	let cliPath: string;
+	let binaryPath: string;
 	let tmpDir: string | undefined;
-	let packageDir: string | undefined;
+	let useNode = false;
 
+	// --- Determine binary path ---
 	if (customBinaryPath) {
-		cliPath = customBinaryPath;
+		binaryPath = customBinaryPath;
+		useNode = !isNativeBinary(customBinaryPath);
 	} else {
 		tmpDir = createTempWorkDir("claude-history");
-		packageDir = path.join(tmpDir, "package");
-		cliPath = path.join(packageDir, "cli.js");
+		const packageDir = path.join(tmpDir, "package");
 
 		downloadPackage(versionOrLabel, tmpDir);
-
 		const tarFile = path.join(tmpDir, `anthropic-ai-claude-code-${versionOrLabel}.tgz`);
 		exec(`tar -xzf ${quote([tarFile])}`, { cwd: tmpDir });
 
-		if (!exists(cliPath)) {
-			console.error(chalk.red(`CLI file not found for version ${versionOrLabel}`));
-			console.error(chalk.gray("Expected path:"), cliPath);
-			console.error(chalk.gray("Package contents:"));
-			try {
-				const packageFiles = readDir(packageDir);
-				packageFiles.forEach((file) => console.error(chalk.gray(`  - ${file}`)));
-			} catch (_e) {
-				console.error(chalk.gray("  Could not list package directory"));
-			}
-			throw new Error(`CLI file not found at ${cliPath}`);
-		}
-	}
-
-	const cliContent = readFile(cliPath);
-
-	const patchResult = { patched: false, content: cliContent };
-	const warningText = "It looks like your version of Claude Code";
-	const warningIndex = cliContent.indexOf(warningText);
-
-	if (warningIndex !== -1) {
-		// Scan backwards from the warning to find "function"
-		let functionIndex = -1;
-		for (let i = warningIndex; i >= 0; i--) {
-			if (cliContent.substring(i, i + 8) === "function") {
-				functionIndex = i;
-				break;
-			}
-		}
-
-		if (functionIndex !== -1) {
-			let openBraceIndex = -1;
-			for (let i = functionIndex; i < cliContent.length; i++) {
-				if (cliContent[i] === "{") {
-					openBraceIndex = i;
-					break;
-				}
-			}
-
-			if (openBraceIndex !== -1) {
-				let braceCount = 1;
-				let closeBraceIndex = -1;
-
-				for (let i = openBraceIndex + 1; i < cliContent.length; i++) {
-					if (cliContent[i] === "{") {
-						braceCount++;
-					} else if (cliContent[i] === "}") {
-						braceCount--;
-						if (braceCount === 0) {
-							closeBraceIndex = i;
-							break;
-						}
+		if (isNativeBinaryPackage(packageDir)) {
+			// Native binary version (≥ 2.1.113) — download platform-specific binary
+			binaryPath = downloadBinary(versionOrLabel, tmpDir);
+			useNode = false;
+		} else {
+			// Old cli.js version
+			binaryPath = path.join(packageDir, "cli.js");
+			if (!exists(binaryPath)) {
+				console.error(chalk.red(`CLI file not found for version ${versionOrLabel}`));
+				console.error(chalk.gray("Expected path:"), binaryPath);
+				console.error(chalk.gray("Package contents:"));
+				try {
+					const packageFiles = readDir(packageDir);
+					for (const file of packageFiles) {
+						console.error(chalk.gray(`  - ${file}`));
 					}
+				} catch (_e) {
+					console.error(chalk.gray("  Could not list package directory"));
 				}
-
-				if (closeBraceIndex !== -1) {
-					const functionDeclaration = cliContent.substring(functionIndex, openBraceIndex + 1);
-					const patchedFunction = `${functionDeclaration} /* Version check disabled */ }`;
-					patchResult.content =
-						cliContent.substring(0, functionIndex) + patchedFunction + cliContent.substring(closeBraceIndex + 1);
-					patchResult.patched = true;
-				}
+				throw new Error(`CLI file not found at ${binaryPath}`);
 			}
+			useNode = true;
 		}
 	}
 
-	if (patchResult.patched) {
-		writeFile(cliPath, patchResult.content);
-	} else if (!customBinaryPath) {
-		console.error(chalk.yellow(`Warning: Could not find version check to patch in version ${versionOrLabel}`));
-		console.error(chalk.gray("This version might not have the version check, continuing anyway..."));
+	// --- Create work directory ---
+	let workDir: string;
+	if (customBinaryPath) {
+		tmpDir = createTempWorkDir("claude-history-custom");
+		workDir = tmpDir;
+	} else {
+		if (!tmpDir) throw new Error("Internal error: tmpDir not initialized");
+		workDir = tmpDir;
 	}
 
 	try {
-		let workDir: string;
-		if (customBinaryPath) {
-			tmpDir = createTempWorkDir("claude-history-custom");
-			workDir = tmpDir;
-		} else {
-			if (!tmpDir) {
-				throw new Error("Internal error: tmpDir not initialized for npm package");
-			}
-			workDir = tmpDir;
-		}
-
-		process.chdir(workDir);
-
-		const claudePathArg = customBinaryPath ? quote([customBinaryPath]) : "./package/cli.js";
-		let additionalArgs = "";
-		if (claudeArgs) {
-			const parsed = parse(claudeArgs);
-			const stringArgs = parsed.filter((entry): entry is string => typeof entry === "string");
-			additionalArgs = quote(stringArgs);
-		}
-		const command = `npx --node-options="--no-warnings" -y @mariozechner/claude-trace --claude-path ${claudePathArg} --no-open --run-with ${additionalArgs}${
-			additionalArgs ? " " : ""
-		}-p "${new Date().toISOString()} is the date. Write a haiku about it."`;
+		// --- Start reverse proxy ---
+		const traceDir = path.join(workDir, ".trace-log");
+		const proxy = await startProxy(traceDir);
 
 		try {
-			exec(command);
-		} catch (error) {
-			console.error(
-				chalk.red(
-					`\nFailed to run claude-trace for ${customBinaryPath ? "custom binary" : `version ${versionOrLabel}`}:`,
-				),
-			);
-			console.error(chalk.gray(`Command: ${command}`));
-			throw error;
+			// --- Build Claude invocation ---
+			const promptArgs = ["-p", `${new Date().toISOString()} is the date. Write a haiku about it.`];
+
+			let additionalArgs: string[] = [];
+			if (claudeArgs) {
+				const parsed = parse(claudeArgs);
+				additionalArgs = parsed.filter((entry): entry is string => typeof entry === "string");
+			}
+
+			const command = useNode ? "node" : binaryPath;
+			const args = useNode ? [binaryPath, ...promptArgs, ...additionalArgs] : [...promptArgs, ...additionalArgs];
+
+			const env = {
+				ANTHROPIC_BASE_URL: `http://127.0.0.1:${proxy.port}`,
+				CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1",
+			};
+
+			if (process.env.DEBUG) {
+				console.log(chalk.gray(`  Command: ${command} ${args.join(" ")}`));
+				console.log(chalk.gray(`  ANTHROPIC_BASE_URL: ${env.ANTHROPIC_BASE_URL}`));
+			}
+
+			// --- Run Claude ---
+			const result = await runClaude(command, args, { cwd: workDir, env });
+			if (result.code !== 0) {
+				console.error(chalk.yellow(`  Claude exited with code ${result.code}`));
+				if (process.env.DEBUG && result.stderr) {
+					console.error(chalk.gray("  stderr:"), result.stderr);
+				}
+			}
+		} finally {
+			await proxy.stop();
 		}
 
-		if (!tmpDir) {
-			throw new Error("Internal error: tmpDir not initialized");
-		}
-
-		const claudeTraceDir = path.join(tmpDir, ".claude-trace");
-		const files = readDir(claudeTraceDir);
-		const jsonlFile = files.find((f) => f.startsWith("log-") && f.endsWith(".jsonl"));
+		// --- Read JSONL log ---
+		const logFiles = readDir(traceDir);
+		const jsonlFile = logFiles.find((f) => f.endsWith(".jsonl"));
 
 		if (!jsonlFile) {
-			throw new Error("No JSONL log file found in .claude-trace directory");
+			throw new Error("No JSONL log file found in trace directory");
 		}
 
-		const jsonlPath = path.join(claudeTraceDir, jsonlFile);
+		const jsonlPath = path.join(traceDir, jsonlFile);
 		const jsonlContent = readFile(jsonlPath);
 		const data: RequestResponsePair[] = jsonlContent
 			.trim()
 			.split("\n")
 			.filter((line) => line.trim())
 			.map((line) => JSON.parse(line));
+
+		if (process.env.DEBUG) {
+			console.log(chalk.gray(`  Found ${data.length} request/response pairs`));
+			for (const pair of data) {
+				console.log(
+					chalk.gray(
+						`  - ${pair.request.body.model || "unknown"} (${pair.request.body.tools?.length || 0} tools)`,
+					),
+				);
+			}
+		}
 
 		const selectedRequest = selectBestRequest(data);
 
@@ -247,7 +250,6 @@ ${toolsFormatted}
 		);
 		throw error;
 	} finally {
-		process.chdir(originalCwd);
 		if (tmpDir) {
 			cleanupTempDir(tmpDir);
 		}
